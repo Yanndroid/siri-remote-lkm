@@ -23,7 +23,7 @@ static const __u8 hid_custom_report_desc[] = {0x05, 0x01, 0x09, 0x00, 0xA1, 0x01
 struct siriremote_config {
   u8 hid_report_id_keys, hid_report_id_touch, hid_report_id_audio;
 
-  u8 is_gen_1;
+  bool is_gen_1;
 
   const struct siriremote_key_map {
     u16 keycode;
@@ -254,6 +254,14 @@ static int siri_remote_magic_byte(struct hid_device *hdev) {
   return hid_hw_raw_request(hdev, buf[0], buf, 2, HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
 }
 
+static void siri_remote_remove_keys(struct siriremote_drvdata *drvdata) {
+  input_unregister_device(drvdata->idev_keys);
+}
+
+static void siri_remote_remove_touch(struct siriremote_drvdata *drvdata) {
+  input_unregister_device(drvdata->idev_touch);
+}
+
 static int siri_remote_probe(struct hid_device *hdev, const struct hid_device_id *id) {
   int ret;
   struct siriremote_drvdata *drvdata;
@@ -305,7 +313,7 @@ static int siri_remote_probe(struct hid_device *hdev, const struct hid_device_id
   ret = siri_remote_idev_create(drvdata, &drvdata->idev_touch, 1);
   if (ret) {
     hid_err(hdev, "siriremote touch input device creation failed\n");
-    goto err_stop_hw;
+    goto err_cleanup_keys;
   }
 
   siri_remote_idev_keys_config(drvdata);
@@ -317,10 +325,14 @@ static int siri_remote_probe(struct hid_device *hdev, const struct hid_device_id
   ret = siri_remote_magic_byte(hdev);
   if (ret < 0) {
     hid_err(hdev, "siriremote magic byte failed\n");
-    goto err_stop_hw;
+    goto err_cleanup_touch;
   }
 
   return 0;
+err_cleanup_touch:
+  siri_remote_remove_touch(drvdata);
+err_cleanup_keys:
+  siri_remote_remove_keys(drvdata);
 err_stop_hw:
   hid_hw_stop(hdev);
   return ret;
@@ -328,8 +340,9 @@ err_stop_hw:
 
 static void siri_remote_remove(struct hid_device *hdev) {
   struct siriremote_drvdata *drvdata = hid_get_drvdata(hdev);
-  input_unregister_device(drvdata->idev_keys);
-  input_unregister_device(drvdata->idev_touch);
+
+  siri_remote_remove_keys(drvdata);
+  siri_remote_remove_touch(drvdata);
 
   hid_hw_stop(hdev);
 }
