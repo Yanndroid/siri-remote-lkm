@@ -1,0 +1,4 @@
+# /etc/udev/rules.d/99-siriremote-audio.rules
+# Runs an user mode OPUS audio decoder service for every "/dev/siriremote-audio*" device
+
+ACTION=="add", KERNEL=="siriremote-audio*", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="siriremote-audio-decoder@%k.service"

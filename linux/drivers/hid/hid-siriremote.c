@@ -1,9 +1,12 @@
 #include <linux/hid.h>
 #include <linux/input/mt.h>
+#include <linux/miscdevice.h>
 
 #include "hid-ids.h"
 
 #define TOUCH_MAX_FINGERS 2
+#define AUDIO_FRAME_SIZE 95
+#define AUDIO_BUF_SIZE 4
 
 #define GEN1_TOUCH_X_MIN 2278
 #define GEN1_TOUCH_X_MAX 3914
@@ -33,11 +36,28 @@ struct siriremote_config {
   u16 button_mouse_mask;
 };
 
+struct siriremote_audio_data {
+  struct miscdevice mdev;
+
+  u8 rbuf[AUDIO_BUF_SIZE][AUDIO_FRAME_SIZE];
+  int head, tail, count;
+
+  struct mutex lock;
+  wait_queue_head_t wq;
+
+  struct kref kref;
+  bool removed;
+
+  int id;
+};
+
 struct siriremote_drvdata {
   struct hid_device *hdev;
   struct input_dev *idev_keys, *idev_touch;
 
   struct siriremote_config config;
+
+  struct siriremote_audio_data *audio_data;
 };
 
 static const struct siriremote_config siriremote_config_gen1 = {
@@ -225,6 +245,143 @@ static int siri_remote_idev_create(struct siriremote_drvdata *drvdata, struct in
   return 0;
 }
 
+static void siri_remote_audio_data_free(struct kref *kref) {
+  struct siriremote_audio_data *audio_data = container_of(kref, struct siriremote_audio_data, kref);
+
+  kfree(audio_data->mdev.name);
+  kfree(audio_data);
+}
+
+static int siri_remote_mdev_audio_open(struct inode *inode, struct file *file) {
+  struct siriremote_audio_data *audio_data = container_of(file->private_data, struct siriremote_audio_data, mdev);
+
+  kref_get(&audio_data->kref);
+  file->private_data = audio_data;
+
+  return 0;
+}
+
+static int siri_remote_mdev_audio_release(struct inode *inode, struct file *file) {
+  struct siriremote_audio_data *audio_data = file->private_data;
+
+  kref_put(&audio_data->kref, siri_remote_audio_data_free);
+
+  return 0;
+}
+
+static ssize_t siri_remote_mdev_audio_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
+  struct siriremote_audio_data *audio_data = file->private_data;
+
+  char frame[AUDIO_FRAME_SIZE];
+
+  if (count < AUDIO_FRAME_SIZE)
+    return -EINVAL;
+
+  if (wait_event_interruptible(audio_data->wq, audio_data->count > 0 || audio_data->removed))
+    return -ERESTARTSYS;
+
+  mutex_lock(&audio_data->lock);
+
+  if (audio_data->removed) {
+    mutex_unlock(&audio_data->lock);
+    return -ENODEV;
+  }
+
+  if (!audio_data->count) {
+    mutex_unlock(&audio_data->lock);
+    return -EAGAIN;
+  }
+
+  memcpy(frame, audio_data->rbuf[audio_data->tail], AUDIO_FRAME_SIZE);
+  audio_data->tail = (audio_data->tail + 1) % AUDIO_BUF_SIZE;
+  audio_data->count--;
+
+  mutex_unlock(&audio_data->lock);
+
+  if (copy_to_user(buf, frame, AUDIO_FRAME_SIZE))
+    return -EFAULT;
+
+  return AUDIO_FRAME_SIZE;
+}
+
+static DEFINE_IDA(siri_remote_mdev_audio_ida);
+
+static struct file_operations siri_remote_mdev_audio_fops = {
+    .owner = THIS_MODULE,
+    .open = siri_remote_mdev_audio_open,
+    .release = siri_remote_mdev_audio_release,
+    .read = siri_remote_mdev_audio_read,
+};
+
+static int siri_remote_mdev_audio_create(struct siriremote_drvdata *drvdata) {
+  int ret;
+  struct siriremote_audio_data *audio_data;
+
+  audio_data = kzalloc(sizeof(struct siriremote_audio_data), GFP_KERNEL);
+  if (!audio_data)
+    return -ENOMEM;
+
+  struct miscdevice *mdev = &audio_data->mdev;
+
+  mutex_init(&audio_data->lock);
+  init_waitqueue_head(&audio_data->wq);
+  kref_init(&audio_data->kref);
+
+  audio_data->id = ida_alloc(&siri_remote_mdev_audio_ida, GFP_KERNEL);
+
+  mdev->minor = MISC_DYNAMIC_MINOR;
+  mdev->name = kasprintf(GFP_KERNEL, "siriremote-audio%d", audio_data->id);
+  mdev->fops = &siri_remote_mdev_audio_fops;
+  mdev->mode = 0666;
+
+  ret = misc_register(mdev);
+  if (ret)
+    goto err_free_audio_data;
+
+  drvdata->audio_data = audio_data;
+
+  return 0;
+err_free_audio_data:
+  kref_put(&audio_data->kref, siri_remote_audio_data_free);
+  return ret;
+}
+
+static void siri_remote_mdev_audio_report(struct siriremote_drvdata *drvdata, u8 *rd, int size) {
+  struct siriremote_audio_data *audio_data = drvdata->audio_data;
+
+  // gen 1 contains keys in same packet, remove it
+  if (drvdata->config.is_gen_1) {
+    rd += 2;
+    size -= 2;
+  }
+
+  if (size != AUDIO_FRAME_SIZE + 4) // 2 bytes unknown, 2 bytes frame nr
+    return;
+
+  int frame_nr = (rd[3] << 8) + rd[2];
+  hid_info(drvdata->hdev, "audio frame %d\n", frame_nr);
+
+  // remove header
+  rd += 4;
+  size -= 4;
+
+  mutex_lock(&audio_data->lock);
+
+  memcpy(audio_data->rbuf[audio_data->head], rd, AUDIO_FRAME_SIZE);
+
+  audio_data->head = (audio_data->head + 1) % AUDIO_BUF_SIZE;
+
+  if (audio_data->count == AUDIO_BUF_SIZE) {
+    audio_data->tail = (audio_data->tail + 1) % AUDIO_BUF_SIZE;
+  } else {
+    audio_data->count++;
+  }
+
+  mutex_unlock(&audio_data->lock);
+
+  wake_up_interruptible(&audio_data->wq);
+}
+
 static int siri_remote_raw_event(struct hid_device *hdev, struct hid_report *report, u8 *rd, int size) {
   // print_hex_dump(KERN_INFO, "hid-siriremote dump ", DUMP_PREFIX_OFFSET, 16, 1, rd, size, true);
 
@@ -243,7 +400,7 @@ static int siri_remote_raw_event(struct hid_device *hdev, struct hid_report *rep
   }
 
   if (report_id == drvdata->config.hid_report_id_audio) {
-    // TODO: audio stuff
+    siri_remote_mdev_audio_report(drvdata, rd, size);
   }
 
   return 0;
@@ -260,6 +417,21 @@ static void siri_remote_remove_keys(struct siriremote_drvdata *drvdata) {
 
 static void siri_remote_remove_touch(struct siriremote_drvdata *drvdata) {
   input_unregister_device(drvdata->idev_touch);
+}
+
+static void siri_remote_remove_audio(struct siriremote_drvdata *drvdata) {
+  struct siriremote_audio_data *audio_data = drvdata->audio_data;
+
+  mutex_lock(&audio_data->lock);
+  audio_data->removed = true;
+  mutex_unlock(&audio_data->lock);
+
+  wake_up_interruptible(&audio_data->wq);
+
+  misc_deregister(&audio_data->mdev);
+  ida_free(&siri_remote_mdev_audio_ida, audio_data->id);
+
+  kref_put(&audio_data->kref, siri_remote_audio_data_free);
 }
 
 static int siri_remote_probe(struct hid_device *hdev, const struct hid_device_id *id) {
@@ -316,6 +488,12 @@ static int siri_remote_probe(struct hid_device *hdev, const struct hid_device_id
     goto err_cleanup_keys;
   }
 
+  ret = siri_remote_mdev_audio_create(drvdata);
+  if (ret) {
+    hid_err(hdev, "siriremote audio misc device registration failed\n");
+    goto err_cleanup_touch;
+  }
+
   siri_remote_idev_keys_config(drvdata);
   siri_remote_idev_touch_config(drvdata);
 
@@ -325,10 +503,12 @@ static int siri_remote_probe(struct hid_device *hdev, const struct hid_device_id
   ret = siri_remote_magic_byte(hdev);
   if (ret < 0) {
     hid_err(hdev, "siriremote magic byte failed\n");
-    goto err_cleanup_touch;
+    goto err_cleanup_audio;
   }
 
   return 0;
+err_cleanup_audio:
+  siri_remote_remove_audio(drvdata);
 err_cleanup_touch:
   siri_remote_remove_touch(drvdata);
 err_cleanup_keys:
@@ -343,6 +523,7 @@ static void siri_remote_remove(struct hid_device *hdev) {
 
   siri_remote_remove_keys(drvdata);
   siri_remote_remove_touch(drvdata);
+  siri_remote_remove_audio(drvdata);
 
   hid_hw_stop(hdev);
 }

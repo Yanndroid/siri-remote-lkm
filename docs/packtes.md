@@ -62,7 +62,10 @@ Packet size is 13/21 bytes (gen 1) and 11/18 bytes (gen 2 & 3) depending on fing
 
 - Report ID (1): 0xFC (gen 1) or 0xFC (gen 2 & 3)
 - Keys (0/2): gen 1 only (see [Keys](#keys))
-- Opus frame (99): 16kHz, 2BpS, 1Ch
+- Unknown (2)
+- Frame number (2)
+- Opus frame size (1)
+- Opus frame (94): Can be decoded to PCM 48kHz, 2BpS, 1Ch
 
 The 1st gen remote advertises an insufficient MTU size of 23 bytes and unlike Windows and MacOS, Linux (bluez) actually meets the official bluetooth protocol specs and truncates the packet to the MTU size. So even though the system receives the full frame, our driver only receives the first part of every frame. This can be patched but will unlikely ever go upstream (see this [issue](https://github.com/bluez/bluez/issues/576)).
 

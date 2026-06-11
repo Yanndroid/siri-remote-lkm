@@ -1,0 +1,7 @@
+# /etc/systemd/user/siriremote-audio-decoder@.service
+[Unit]
+Description=Siri Remote OPUS decoder for %I
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/siriremote-audio-decoder /dev/%i
